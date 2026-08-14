@@ -1,0 +1,38 @@
+server:
+  listen: ":8888"
+  max_body_bytes: 33554432
+  read_header_timeout: 10s
+  idle_timeout: 120s
+  shutdown_timeout: 20s
+  api_key: ""
+
+deepseek:
+  base_url: "http://192.168.100.10:18888"
+  model: "deepseek-v4-flash-0731"
+  api_key: ""
+  render_timeout: 180s
+  response_header_timeout: 300s
+
+vision:
+  enabled: true
+  base_url: "http://192.168.100.10:8890"
+  model: "qwen3.5-9b-vision"
+  api_key: ""
+  timeout: 90s
+  max_tokens: 512
+  max_image_bytes: 12582912
+  allow_remote_images: true
+  allow_private_image_hosts: false
+  cache_entries: 1024
+
+admission:
+  long_prompt_tokens: 98304
+  total_prompt_token_budget: 262144
+  max_active_requests: 4
+  max_active_long_requests: 1
+  queue_size: 8
+  queue_timeout: 60s
+
+circuit_breaker:
+  failure_threshold: 3
+  open_duration: 20s

@@ -1,0 +1,11 @@
+services:
+  proxy:
+    image: ghcr.io/yangs1202/dgx-llm-simple-proxy:latest
+    pull_policy: always
+    network_mode: host
+    restart: unless-stopped
+    command: ["-config", "/etc/dgx-llm-simple-proxy/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/dgx-llm-simple-proxy/config.yaml:ro
+    security_opt:
+      - no-new-privileges:true

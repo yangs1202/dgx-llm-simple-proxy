@@ -90,6 +90,16 @@ make verify
 
 CI runs formatting checks, `go vet`, race-enabled tests, and a build on GitHub's public `ubuntu-latest` runners. The Package workflow publishes the multi-architecture image to GitHub Container Registry.
 
+## DGX Spark deployment
+
+The two-node deployment files under `deploy/dgx` expose the proxy on port 8888 and route DeepSeek and Vision traffic to the head node at `192.168.100.10`. DeepSeek must listen on port 18888 and Vision on port 8890.
+
+```sh
+cd deploy/dgx
+docker compose pull
+docker compose up -d
+```
+
 ## License
 
 MIT
