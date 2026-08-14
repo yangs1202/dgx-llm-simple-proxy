@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -386,10 +387,14 @@ func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	a := s.admission.Snapshot()
 	d := s.deepBreaker.Snapshot()
 	v := s.visionBreaker.Snapshot()
+	vllmMetrics, err := s.fetchVLLMMetrics(r.Context())
+	if err != nil {
+		s.logger.Warn("fetch vLLM metrics", "error", err)
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintf(w, "dgx_proxy_requests_total %d\n", s.requests.Load())
 	fmt.Fprintf(w, "dgx_proxy_errors_total %d\n", s.errors.Load())
@@ -402,6 +407,49 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "dgx_proxy_queued_requests %d\n", a.QueuedRequests)
 	fmt.Fprintf(w, "dgx_proxy_circuit_open{upstream=\"deepseek\"} %d\n", boolNumber(d.State != circuit.StateClosed))
 	fmt.Fprintf(w, "dgx_proxy_circuit_open{upstream=\"vision\"} %d\n", boolNumber(v.State != circuit.StateClosed))
+	_, _ = io.WriteString(w, vllmMetrics)
+}
+
+func (s *Server) fetchVLLMMetrics(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(s.cfg.DeepSeek.BaseURL, "/metrics"), nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	response, err := s.deepClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("request vLLM metrics: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("vLLM metrics returned HTTP %d", response.StatusCode)
+	}
+
+	wanted := []string{
+		"vllm:kv_cache_usage_perc",
+		"vllm:num_requests_running",
+		"vllm:num_requests_waiting",
+	}
+	var output strings.Builder
+	scanner := bufio.NewScanner(io.LimitReader(response.Body, 2<<20))
+	for scanner.Scan() {
+		line := scanner.Text()
+		for _, metric := range wanted {
+			if strings.HasPrefix(line, "# HELP "+metric+" ") ||
+				strings.HasPrefix(line, "# TYPE "+metric+" ") ||
+				strings.HasPrefix(line, metric+"{") ||
+				strings.HasPrefix(line, metric+" ") {
+				output.WriteString(line)
+				output.WriteByte('\n')
+				break
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read vLLM metrics: %w", err)
+	}
+	return output.String(), nil
 }
 
 func boolNumber(value bool) int {

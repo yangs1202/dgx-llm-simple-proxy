@@ -20,7 +20,7 @@ Other endpoints:
 - `GET /v1/models`
 - `GET /healthz`
 - `GET /readyz`
-- `GET /metrics` (Prometheus text format)
+- `GET /metrics` (Prometheus text format, including selected vLLM KV-cache and request gauges)
 
 ## Configuration
 

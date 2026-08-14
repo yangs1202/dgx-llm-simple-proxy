@@ -113,6 +113,60 @@ func TestImageIsDescribedOnceAndReplaced(t *testing.T) {
 	}
 }
 
+func TestMetricsIncludesSelectedVLLMMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `# HELP vllm:kv_cache_usage_perc KV-cache usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model_name="deepseek"} 0.42
+vllm:num_requests_running{model_name="deepseek"} 2
+vllm:num_requests_waiting{model_name="deepseek"} 1
+vllm:prompt_tokens_total{model_name="deepseek"} 999
+`)
+	}))
+	defer upstream.Close()
+
+	server := httptest.NewServer(New(testConfig(upstream.URL, ""), discardLogger()).Handler())
+	defer server.Close()
+	response, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+
+	for _, metric := range []string{"vllm:kv_cache_usage_perc", "vllm:num_requests_running", "vllm:num_requests_waiting"} {
+		if !strings.Contains(string(body), metric) {
+			t.Fatalf("metric %s is missing from response:\n%s", metric, body)
+		}
+	}
+	if strings.Contains(string(body), "vllm:prompt_tokens_total") {
+		t.Fatalf("unexpected vLLM metric was exposed:\n%s", body)
+	}
+}
+
+func TestMetricsSurvivesVLLMFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	server := httptest.NewServer(New(testConfig(upstream.URL, ""), discardLogger()).Handler())
+	defer server.Close()
+	response, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "dgx_proxy_requests_total") {
+		t.Fatalf("unexpected response: status=%d body=%s", response.StatusCode, body)
+	}
+}
+
 func testConfig(deepURL, visionURL string) config.Config {
 	return config.Config{
 		Server: config.ServerConfig{MaxBodyBytes: 1 << 20},
