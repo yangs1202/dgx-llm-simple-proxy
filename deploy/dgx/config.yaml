@@ -14,12 +14,12 @@ deepseek:
   response_header_timeout: 300s
 
 vision:
-  enabled: false
-  base_url: "http://192.168.100.10:8890"
-  model: "qwen3.5-9b-vision"
-  api_key: ""
-  timeout: 90s
-  max_tokens: 512
+  enabled: true
+  base_url: "https://llm.yangs.sh"
+  model: "ollama/minimax-m3"
+  api_key: "${VISION_API_KEY}"
+  timeout: 180s
+  max_tokens: 2048
   max_image_bytes: 12582912
   allow_remote_images: true
   allow_private_image_hosts: false

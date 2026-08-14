@@ -92,10 +92,12 @@ CI runs formatting checks, `go vet`, race-enabled tests, and a build on GitHub's
 
 ## DGX Spark deployment
 
-The two-node deployment files under `deploy/dgx` expose the proxy on port 8888 and route DeepSeek traffic to the head node at `192.168.100.10`. DeepSeek must listen on port 18888. Vision is disabled in the DGX deployment because the co-located vision model does not fit reliably alongside the configured 1M-context DeepSeek service.
+The two-node deployment files under `deploy/dgx` expose the proxy on port 8888 and route DeepSeek traffic to the head node at `192.168.100.10`. DeepSeek must listen on port 18888. Vision requests use the external `ollama/minimax-m3` endpoint so the configured 1M-context DeepSeek service does not give up GPU memory.
 
 ```sh
 cd deploy/dgx
+cp .env.example .env
+# Set VISION_API_KEY in .env and restrict access with chmod 600 .env.
 docker compose pull
 docker compose up -d
 ```
