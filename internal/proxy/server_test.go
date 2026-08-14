@@ -35,7 +35,7 @@ func TestPassthroughAndStreaming(t *testing.T) {
 
 	server := httptest.NewServer(New(testConfig(upstream.URL, ""), discardLogger()).Handler())
 	defer server.Close()
-	body := `{"model":"client-model","messages":[{"role":"user","content":"hello"}],"stream":true,"thinking":{"type":"disabled"},"parallel_tool_calls":true,"custom_parameter":{"keep":42}}`
+	body := `{"model":"client-model","messages":[{"role":"user","content":"hello"}],"stream":true,"thinking":false,"parallel_tool_calls":true,"custom_parameter":{"keep":42}}`
 	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -55,8 +55,36 @@ func TestPassthroughAndStreaming(t *testing.T) {
 	if _, ok := completionPayload["thinking"]; !ok {
 		t.Fatal("thinking was dropped")
 	}
+	kwargs, ok := completionPayload["chat_template_kwargs"].(map[string]any)
+	if !ok || kwargs["thinking"] != false || kwargs["reasoning_effort"] != nil {
+		t.Fatalf("thinking compatibility mapping is invalid: %#v", kwargs)
+	}
 	if _, ok := completionPayload["custom_parameter"]; !ok {
 		t.Fatal("unknown parameter was dropped")
+	}
+}
+
+func TestNormalizeThinkingPreservesTemplateOptions(t *testing.T) {
+	payload := map[string]any{
+		"thinking":         true,
+		"reasoning_effort": "high",
+		"chat_template_kwargs": map[string]any{
+			"custom": "keep",
+		},
+	}
+	normalizeThinking(payload)
+
+	kwargs := payload["chat_template_kwargs"].(map[string]any)
+	if kwargs["thinking"] != true || kwargs["reasoning_effort"] != "high" || kwargs["custom"] != "keep" {
+		t.Fatalf("unexpected template kwargs: %#v", kwargs)
+	}
+}
+
+func TestNormalizeThinkingIgnoresNonBooleanValue(t *testing.T) {
+	payload := map[string]any{"thinking": map[string]any{"type": "enabled"}}
+	normalizeThinking(payload)
+	if _, exists := payload["chat_template_kwargs"]; exists {
+		t.Fatalf("non-boolean thinking was modified: %#v", payload)
 	}
 }
 
