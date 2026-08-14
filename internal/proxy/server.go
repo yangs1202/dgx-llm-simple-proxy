@@ -85,7 +85,6 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload["model"] = s.cfg.DeepSeek.Model
-	normalizeThinking(payload)
 	if err := s.replaceImages(r.Context(), payload); err != nil {
 		if errors.Is(err, circuit.ErrOpen) {
 			s.writeCircuitError(w, s.visionBreaker, err)
@@ -130,22 +129,6 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer response.Body.Close()
 	s.copyResponse(w, response)
-}
-
-func normalizeThinking(payload map[string]any) {
-	thinking, ok := payload["thinking"].(bool)
-	if !ok {
-		return
-	}
-	kwargs, ok := payload["chat_template_kwargs"].(map[string]any)
-	if !ok {
-		kwargs = make(map[string]any)
-		payload["chat_template_kwargs"] = kwargs
-	}
-	kwargs["thinking"] = thinking
-	if effort, ok := payload["reasoning_effort"].(string); ok {
-		kwargs["reasoning_effort"] = effort
-	}
 }
 
 func (s *Server) replaceImages(ctx context.Context, payload map[string]any) error {
