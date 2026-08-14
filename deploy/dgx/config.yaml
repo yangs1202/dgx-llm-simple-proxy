@@ -14,7 +14,7 @@ deepseek:
   response_header_timeout: 300s
 
 vision:
-  enabled: true
+  enabled: false
   base_url: "http://192.168.100.10:8890"
   model: "qwen3.5-9b-vision"
   api_key: ""
