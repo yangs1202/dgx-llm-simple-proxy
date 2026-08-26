@@ -18,7 +18,7 @@ func TestPassthroughAndStreaming(t *testing.T) {
 	var completionPayload map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/chat/completions/render":
+		case "/v1/tokenize":
 			writeJSON(w, http.StatusOK, map[string]any{"token_ids": []int{1, 2, 3}})
 		case "/v1/chat/completions":
 			if err := json.NewDecoder(r.Body).Decode(&completionPayload); err != nil {
@@ -83,7 +83,7 @@ func TestImageIsDescribedOnceAndReplaced(t *testing.T) {
 		if strings.Contains(string(encoded), "a red square") && !strings.Contains(string(encoded), "image_url") {
 			sawDescription.Store(true)
 		}
-		if strings.HasSuffix(r.URL.Path, "/render") {
+		if r.URL.Path == "/v1/tokenize" {
 			writeJSON(w, http.StatusOK, map[string]any{"token_ids": []int{1}})
 			return
 		}

@@ -277,7 +277,7 @@ func textContent(content any) string {
 func (s *Server) renderTokenCount(ctx context.Context, body []byte) (int, error) {
 	renderCtx, cancel := context.WithTimeout(ctx, s.cfg.DeepSeek.RenderTimeout)
 	defer cancel()
-	response, err := s.doUpstream(renderCtx, s.deepClient, s.deepBreaker, joinURL(s.cfg.DeepSeek.BaseURL, "/v1/chat/completions/render"), s.cfg.DeepSeek.APIKey, body)
+	response, err := s.doUpstream(renderCtx, s.deepClient, s.deepBreaker, joinURL(s.cfg.DeepSeek.BaseURL, "/v1/tokenize"), s.cfg.DeepSeek.APIKey, body)
 	if err != nil {
 		return 0, err
 	}
