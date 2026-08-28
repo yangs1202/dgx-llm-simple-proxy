@@ -184,6 +184,40 @@ func TestModelsListsConfiguredAliases(t *testing.T) {
 	}
 }
 
+func TestReadyUsesConfiguredDefaultRoute(t *testing.T) {
+	deep := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "stopped", http.StatusServiceUnavailable)
+	}))
+	defer deep.Close()
+	glm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+	defer glm.Close()
+
+	cfg := testConfig(deep.URL, "")
+	cfg.Upstreams = map[string]config.UpstreamConfig{
+		"glm": {BaseURL: glm.URL, Model: "GLM-5.3-Flash-EXL3", TokenizePath: "/tokenize", RenderTimeout: time.Second, ResponseHeaderTimeout: time.Second},
+	}
+	cfg.Routes = map[string]config.RouteConfig{
+		"deepseek-v4-flash-0731": {Upstream: "glm", ThinkingAdapter: config.ThinkingQwen},
+	}
+	server := httptest.NewServer(New(cfg, discardLogger()).Handler())
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", response.StatusCode)
+	}
+}
+
 func TestTokenCountPathDefaultsToDeepSeekEndpoint(t *testing.T) {
 	if got := tokenCountPath(config.UpstreamConfig{}); got != "/v1/chat/completions/render" {
 		t.Fatalf("unexpected default token count path: %s", got)

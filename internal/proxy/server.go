@@ -182,6 +182,10 @@ func (s *Server) resolveRoute(requestedModel any) (route, bool) {
 	return route{upstream: upstream, model: modelName, adapter: adapter}, true
 }
 
+func (s *Server) defaultRoute() (route, bool) {
+	return s.resolveRoute(s.cfg.DeepSeek.Model)
+}
+
 func adaptThinking(payload map[string]any, adapter config.ThinkingAdapter) {
 	switch adapter {
 	case config.ThinkingQwen:
@@ -530,22 +534,22 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	defaultUpstream, ok := s.upstreams["deepseek"]
+	defaultRoute, ok := s.defaultRoute()
 	if !ok {
-		s.writeError(w, http.StatusServiceUnavailable, "not_ready", "default upstream is not configured")
+		s.writeError(w, http.StatusServiceUnavailable, "not_ready", "default route upstream is not configured")
 		return
 	}
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, joinURL(defaultUpstream.config.BaseURL, "/health"), nil)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, joinURL(defaultRoute.upstream.config.BaseURL, "/health"), nil)
 	if err != nil {
 		s.writeError(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 		return
 	}
-	response, err := defaultUpstream.client.Do(request)
+	response, err := defaultRoute.upstream.client.Do(request)
 	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 		if response != nil {
 			response.Body.Close()
 		}
-		s.writeError(w, http.StatusServiceUnavailable, "not_ready", "DeepSeek upstream is not ready")
+		s.writeError(w, http.StatusServiceUnavailable, "not_ready", "default route upstream is not ready")
 		return
 	}
 	response.Body.Close()
@@ -608,15 +612,15 @@ func (s *Server) upstreamNames() []string {
 func (s *Server) fetchVLLMMetrics(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	defaultUpstream, ok := s.upstreams["deepseek"]
+	defaultRoute, ok := s.defaultRoute()
 	if !ok {
-		return "", errors.New("default upstream is not configured")
+		return "", errors.New("default route upstream is not configured")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(defaultUpstream.config.BaseURL, "/metrics"), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(defaultRoute.upstream.config.BaseURL, "/metrics"), nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
-	response, err := defaultUpstream.client.Do(request)
+	response, err := defaultRoute.upstream.client.Do(request)
 	if err != nil {
 		return "", fmt.Errorf("request vLLM metrics: %w", err)
 	}
