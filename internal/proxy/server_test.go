@@ -82,7 +82,7 @@ func TestAliasRouteToQwenAdaptsThinking(t *testing.T) {
 
 	cfg := testConfig(upstream.URL, "")
 	cfg.Upstreams = map[string]config.UpstreamConfig{
-		"qwen": {BaseURL: upstream.URL, Model: "qwen3.8-27b", RenderTimeout: time.Second, ResponseHeaderTimeout: time.Second},
+		"qwen": {BaseURL: upstream.URL, Model: "qwen3.8-27b", TokenizePath: "/v1/tokenize", RenderTimeout: time.Second, ResponseHeaderTimeout: time.Second},
 	}
 	cfg.Routes = map[string]config.RouteConfig{
 		"deepseek": {Upstream: "qwen", ThinkingAdapter: config.ThinkingQwen},
@@ -181,6 +181,15 @@ func TestModelsListsConfiguredAliases(t *testing.T) {
 	}
 	if len(payload.Data) != 2 || payload.Data[0].ID != "deepseek" || payload.Data[1].ID != "qwen" {
 		t.Fatalf("unexpected model aliases: %#v", payload.Data)
+	}
+}
+
+func TestTokenCountPathDefaultsToDeepSeekEndpoint(t *testing.T) {
+	if got := tokenCountPath(config.UpstreamConfig{}); got != "/v1/chat/completions/render" {
+		t.Fatalf("unexpected default token count path: %s", got)
+	}
+	if got := tokenCountPath(config.UpstreamConfig{TokenizePath: "/v1/tokenize"}); got != "/v1/tokenize" {
+		t.Fatalf("configured token count path was ignored: %s", got)
 	}
 }
 
@@ -293,6 +302,7 @@ func testConfig(deepURL, visionURL string) config.Config {
 		Server: config.ServerConfig{MaxBodyBytes: 1 << 20},
 		DeepSeek: config.UpstreamConfig{
 			BaseURL: deepURL, Model: "deepseek-v4-flash-0731",
+			TokenizePath:  "/v1/tokenize",
 			RenderTimeout: time.Second, ResponseHeaderTimeout: time.Second,
 		},
 		Vision: config.VisionConfig{

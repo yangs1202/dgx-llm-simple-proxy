@@ -10,7 +10,7 @@ The default public model name is `deepseek-v4-flash-0731`.
 - Request fields are passed through unchanged, including `stream`, `reasoning_effort`, tools, and `parallel_tool_calls`. `model` selects a configured route and is replaced with that route's upstream model; image parts are replaced with text descriptions.
 - Images supplied as data URLs or remote HTTP(S) URLs are described by the configured vision model.
 - Descriptions are cached by SHA-256 image content. Concurrent requests for the same image share one vision call. The cache is in memory and lasts for the process lifetime.
-- Prompt tokens are counted with the selected upstream's `/v1/tokenize` endpoint before admission.
+- Prompt tokens are counted with each upstream's configured `tokenize_path` before admission. It defaults to DeepSeek's `/v1/chat/completions/render` for backward compatibility.
 - Long requests can be limited independently while short requests continue to use the remaining capacity.
 - Three consecutive transport errors or HTTP 5xx responses open the affected upstream circuit for 20 seconds by default. The proxy returns HTTP 503 while open and permits one half-open probe afterward.
 - Client cancellation is propagated to both upstreams.
@@ -23,6 +23,7 @@ upstreams:
   qwen:
     base_url: "http://127.0.0.1:8892"
     model: "qwen3.8-27b"
+    tokenize_path: "/v1/tokenize"
     render_timeout: 180s
     response_header_timeout: 300s
 routes:

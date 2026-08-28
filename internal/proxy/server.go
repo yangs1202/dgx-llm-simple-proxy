@@ -437,14 +437,14 @@ func textContent(content any) string {
 func (s *Server) renderTokenCount(ctx context.Context, target route, body []byte) (int, error) {
 	renderCtx, cancel := context.WithTimeout(ctx, target.upstream.config.RenderTimeout)
 	defer cancel()
-	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, joinURL(target.upstream.config.BaseURL, "/v1/tokenize"), target.upstream.config.APIKey, body)
+	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, joinURL(target.upstream.config.BaseURL, tokenCountPath(target.upstream.config)), target.upstream.config.APIKey, body)
 	if err != nil {
 		return 0, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 8192))
-		return 0, fmt.Errorf("render returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(message)))
+		return 0, fmt.Errorf("token count returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(message)))
 	}
 	var result struct {
 		TokenIDs []json.Number `json:"token_ids"`
@@ -453,6 +453,13 @@ func (s *Server) renderTokenCount(ctx context.Context, target route, body []byte
 		return 0, fmt.Errorf("decode render response: %w", err)
 	}
 	return len(result.TokenIDs), nil
+}
+
+func tokenCountPath(upstream config.UpstreamConfig) string {
+	if upstream.TokenizePath != "" {
+		return upstream.TokenizePath
+	}
+	return "/v1/chat/completions/render"
 }
 
 func (s *Server) doUpstream(ctx context.Context, client *http.Client, breaker *circuit.Breaker, endpoint, apiKey string, body []byte) (*http.Response, error) {

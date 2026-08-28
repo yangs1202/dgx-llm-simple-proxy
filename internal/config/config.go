@@ -33,6 +33,7 @@ type UpstreamConfig struct {
 	BaseURL               string        `yaml:"base_url"`
 	Model                 string        `yaml:"model"`
 	APIKey                string        `yaml:"api_key"`
+	TokenizePath          string        `yaml:"tokenize_path"`
 	RenderTimeout         time.Duration `yaml:"render_timeout"`
 	ResponseHeaderTimeout time.Duration `yaml:"response_header_timeout"`
 }
