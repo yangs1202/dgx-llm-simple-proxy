@@ -14,6 +14,20 @@ deepseek:
   render_timeout: 180s
   response_header_timeout: 300s
 
+# Optional alias routing. The request model is used as the key under routes.
+# This example makes model: "deepseek" use Qwen's upstream and model instead.
+# upstreams:
+#   qwen:
+#     base_url: "http://127.0.0.1:8892"
+#     model: "qwen3.8-27b"
+#     api_key: ""
+#     render_timeout: 180s
+#     response_header_timeout: 300s
+# routes:
+#   deepseek:
+#     upstream: qwen
+#     thinking_adapter: qwen
+
 vision:
   enabled: true
   base_url: "http://127.0.0.1:8890"

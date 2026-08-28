@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -27,12 +28,11 @@ import (
 type Server struct {
 	cfg           config.Config
 	logger        *slog.Logger
-	deepClient    *http.Client
+	upstreams     map[string]*upstream
 	visionClient  *http.Client
 	images        *imageutil.Reader
 	cache         *imageutil.DescriptionCache
 	admission     *admission.Controller
-	deepBreaker   *circuit.Breaker
 	visionBreaker *circuit.Breaker
 	requests      atomic.Uint64
 	errors        atomic.Uint64
@@ -41,15 +41,35 @@ type Server struct {
 	cacheMisses   atomic.Uint64
 }
 
+type upstream struct {
+	config  config.UpstreamConfig
+	client  *http.Client
+	breaker *circuit.Breaker
+}
+
+type route struct {
+	upstream *upstream
+	model    string
+	adapter  config.ThinkingAdapter
+}
+
 func New(cfg config.Config, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	upstreams := make(map[string]*upstream, len(cfg.UpstreamConfigs()))
+	for name, upstreamConfig := range cfg.UpstreamConfigs() {
+		upstreams[name] = &upstream{
+			config:  upstreamConfig,
+			client:  &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: upstreamConfig.ResponseHeaderTimeout}},
+			breaker: circuit.New(cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.OpenDuration),
+		}
 	}
 	visionClient := &http.Client{Timeout: cfg.Vision.Timeout}
 	return &Server{
 		cfg:          cfg,
 		logger:       logger,
-		deepClient:   &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: cfg.DeepSeek.ResponseHeaderTimeout}},
+		upstreams:    upstreams,
 		visionClient: visionClient,
 		images:       imageutil.NewReader(cfg.Vision.MaxImageBytes, cfg.Vision.AllowRemoteImages, cfg.Vision.AllowPrivateImageHosts, visionClient),
 		cache:        imageutil.NewDescriptionCache(cfg.Vision.CacheEntries),
@@ -60,7 +80,6 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 			MaxActiveLongRequests:  cfg.Admission.MaxActiveLongRequests,
 			QueueSize:              cfg.Admission.QueueSize,
 		}),
-		deepBreaker:   circuit.New(cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.OpenDuration),
 		visionBreaker: circuit.New(cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.OpenDuration),
 	}
 }
@@ -85,7 +104,13 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON request: "+err.Error())
 		return
 	}
-	payload["model"] = s.cfg.DeepSeek.Model
+	route, ok := s.resolveRoute(payload["model"])
+	if !ok {
+		s.writeError(w, http.StatusBadGateway, "upstream_error", "configured route is unavailable")
+		return
+	}
+	payload["model"] = route.model
+	adaptThinking(payload, route.adapter)
 	if err := s.replaceImages(r.Context(), payload); err != nil {
 		if errors.Is(err, circuit.ErrOpen) {
 			s.writeCircuitError(w, s.visionBreaker, err)
@@ -100,10 +125,10 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	tokens, err := s.renderTokenCount(r.Context(), body)
+	tokens, err := s.renderTokenCount(r.Context(), route, body)
 	if err != nil {
 		if errors.Is(err, circuit.ErrOpen) {
-			s.writeCircuitError(w, s.deepBreaker, err)
+			s.writeCircuitError(w, route.upstream.breaker, err)
 			return
 		}
 		s.writeError(w, http.StatusBadGateway, "upstream_error", "prompt tokenization failed: "+err.Error())
@@ -123,13 +148,148 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	response, err := s.doUpstream(r.Context(), s.deepClient, s.deepBreaker, joinURL(s.cfg.DeepSeek.BaseURL, "/v1/chat/completions"), s.cfg.DeepSeek.APIKey, body)
+	response, err := s.doUpstream(r.Context(), route.upstream.client, route.upstream.breaker, joinURL(route.upstream.config.BaseURL, "/v1/chat/completions"), route.upstream.config.APIKey, body)
 	if err != nil {
-		s.writeCircuitError(w, s.deepBreaker, err)
+		s.writeCircuitError(w, route.upstream.breaker, err)
 		return
 	}
 	defer response.Body.Close()
 	s.copyResponse(w, response)
+}
+
+func (s *Server) resolveRoute(requestedModel any) (route, bool) {
+	model, _ := requestedModel.(string)
+	routeConfig, exists := s.cfg.Routes[model]
+	if !exists {
+		routeConfig = config.RouteConfig{Upstream: "deepseek", ThinkingAdapter: config.ThinkingDeepSeek}
+	}
+	upstreamName := routeConfig.Upstream
+	if upstreamName == "" {
+		upstreamName = "deepseek"
+	}
+	upstream, exists := s.upstreams[upstreamName]
+	if !exists {
+		return route{}, false
+	}
+	modelName := routeConfig.Model
+	if modelName == "" {
+		modelName = upstream.config.Model
+	}
+	adapter := routeConfig.ThinkingAdapter
+	if adapter == "" {
+		adapter = config.ThinkingPassthrough
+	}
+	return route{upstream: upstream, model: modelName, adapter: adapter}, true
+}
+
+func adaptThinking(payload map[string]any, adapter config.ThinkingAdapter) {
+	switch adapter {
+	case config.ThinkingQwen:
+		adaptThinkingForQwen(payload)
+	case config.ThinkingDeepSeek:
+		adaptThinkingForDeepSeek(payload)
+	}
+}
+
+func adaptThinkingForQwen(payload map[string]any) {
+	enabled, present := thinkingEnabled(payload)
+	if !present {
+		return
+	}
+	kwargs, _ := payload["chat_template_kwargs"].(map[string]any)
+	if kwargs == nil {
+		kwargs = make(map[string]any)
+	}
+	kwargs["enable_thinking"] = enabled
+	payload["chat_template_kwargs"] = kwargs
+	delete(payload, "thinking")
+}
+
+func adaptThinkingForDeepSeek(payload map[string]any) {
+	enabled, present := thinkingEnabled(payload)
+	if present {
+		if raw, exists := payload["thinking"]; !exists {
+			payload["thinking"] = map[string]any{"type": thinkingType(enabled)}
+		} else if _, isObject := raw.(map[string]any); !isObject {
+			payload["thinking"] = map[string]any{"type": thinkingType(enabled)}
+		}
+	}
+	removeQwenThinkingOption(payload)
+}
+
+func thinkingEnabled(payload map[string]any) (bool, bool) {
+	if raw, exists := payload["thinking"]; exists {
+		if enabled, ok := thinkingValue(raw); ok {
+			return enabled, true
+		}
+	}
+	if kwargs, ok := payload["chat_template_kwargs"].(map[string]any); ok {
+		if enabled, ok := kwargs["enable_thinking"].(bool); ok {
+			return enabled, true
+		}
+	}
+	if effort, ok := payload["reasoning_effort"].(string); ok && effort != "" {
+		return !isThinkingDisabled(effort), true
+	}
+	return false, false
+}
+
+func thinkingValue(raw any) (bool, bool) {
+	switch value := raw.(type) {
+	case bool:
+		return value, true
+	case string:
+		switch strings.ToLower(value) {
+		case "enabled", "on", "true":
+			return true, true
+		case "disabled", "off", "false":
+			return false, true
+		default:
+			return false, false
+		}
+	case map[string]any:
+		typeName, ok := value["type"].(string)
+		if !ok {
+			return false, false
+		}
+		switch strings.ToLower(typeName) {
+		case "enabled", "on", "true":
+			return true, true
+		case "disabled", "off", "false":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
+func isThinkingDisabled(effort string) bool {
+	switch strings.ToLower(effort) {
+	case "none", "disabled", "off", "false":
+		return true
+	default:
+		return false
+	}
+}
+
+func thinkingType(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+func removeQwenThinkingOption(payload map[string]any) {
+	kwargs, ok := payload["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(kwargs, "enable_thinking")
+	if len(kwargs) == 0 {
+		delete(payload, "chat_template_kwargs")
+	}
 }
 
 func (s *Server) replaceImages(ctx context.Context, payload map[string]any) error {
@@ -274,10 +434,10 @@ func textContent(content any) string {
 	return strings.Join(texts, "\n")
 }
 
-func (s *Server) renderTokenCount(ctx context.Context, body []byte) (int, error) {
-	renderCtx, cancel := context.WithTimeout(ctx, s.cfg.DeepSeek.RenderTimeout)
+func (s *Server) renderTokenCount(ctx context.Context, target route, body []byte) (int, error) {
+	renderCtx, cancel := context.WithTimeout(ctx, target.upstream.config.RenderTimeout)
 	defer cancel()
-	response, err := s.doUpstream(renderCtx, s.deepClient, s.deepBreaker, joinURL(s.cfg.DeepSeek.BaseURL, "/v1/tokenize"), s.cfg.DeepSeek.APIKey, body)
+	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, joinURL(target.upstream.config.BaseURL, "/v1/tokenize"), target.upstream.config.APIKey, body)
 	if err != nil {
 		return 0, err
 	}
@@ -363,12 +523,17 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, joinURL(s.cfg.DeepSeek.BaseURL, "/health"), nil)
+	defaultUpstream, ok := s.upstreams["deepseek"]
+	if !ok {
+		s.writeError(w, http.StatusServiceUnavailable, "not_ready", "default upstream is not configured")
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, joinURL(defaultUpstream.config.BaseURL, "/health"), nil)
 	if err != nil {
 		s.writeError(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 		return
 	}
-	response, err := s.deepClient.Do(request)
+	response, err := defaultUpstream.client.Do(request)
 	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 		if response != nil {
 			response.Body.Close()
@@ -381,15 +546,26 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
+	ids := make([]string, 0, len(s.cfg.Routes))
+	for alias := range s.cfg.Routes {
+		ids = append(ids, alias)
+	}
+	if len(ids) == 0 {
+		ids = append(ids, s.cfg.DeepSeek.Model)
+	}
+	sort.Strings(ids)
+	data := make([]any, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, map[string]any{"id": id, "object": "model", "owned_by": "yangs1202"})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   []any{map[string]any{"id": s.cfg.DeepSeek.Model, "object": "model", "owned_by": "yangs1202"}},
+		"data":   data,
 	})
 }
 
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	a := s.admission.Snapshot()
-	d := s.deepBreaker.Snapshot()
 	v := s.visionBreaker.Snapshot()
 	vllmMetrics, err := s.fetchVLLMMetrics(r.Context())
 	if err != nil {
@@ -405,19 +581,35 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "dgx_proxy_active_long_requests %d\n", a.ActiveLong)
 	fmt.Fprintf(w, "dgx_proxy_active_prompt_tokens %d\n", a.ActivePromptTokens)
 	fmt.Fprintf(w, "dgx_proxy_queued_requests %d\n", a.QueuedRequests)
-	fmt.Fprintf(w, "dgx_proxy_circuit_open{upstream=\"deepseek\"} %d\n", boolNumber(d.State != circuit.StateClosed))
+	for _, name := range s.upstreamNames() {
+		upstream := s.upstreams[name]
+		fmt.Fprintf(w, "dgx_proxy_circuit_open{upstream=%q} %d\n", name, boolNumber(upstream.breaker.Snapshot().State != circuit.StateClosed))
+	}
 	fmt.Fprintf(w, "dgx_proxy_circuit_open{upstream=\"vision\"} %d\n", boolNumber(v.State != circuit.StateClosed))
 	_, _ = io.WriteString(w, vllmMetrics)
+}
+
+func (s *Server) upstreamNames() []string {
+	names := make([]string, 0, len(s.upstreams))
+	for name := range s.upstreams {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (s *Server) fetchVLLMMetrics(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(s.cfg.DeepSeek.BaseURL, "/metrics"), nil)
+	defaultUpstream, ok := s.upstreams["deepseek"]
+	if !ok {
+		return "", errors.New("default upstream is not configured")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(defaultUpstream.config.BaseURL, "/metrics"), nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
-	response, err := s.deepClient.Do(request)
+	response, err := defaultUpstream.client.Do(request)
 	if err != nil {
 		return "", fmt.Errorf("request vLLM metrics: %w", err)
 	}

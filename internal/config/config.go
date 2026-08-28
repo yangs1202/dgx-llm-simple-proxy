@@ -11,11 +11,13 @@ import (
 )
 
 type Config struct {
-	Server         ServerConfig         `yaml:"server"`
-	DeepSeek       UpstreamConfig       `yaml:"deepseek"`
-	Vision         VisionConfig         `yaml:"vision"`
-	Admission      AdmissionConfig      `yaml:"admission"`
-	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+	Server         ServerConfig              `yaml:"server"`
+	DeepSeek       UpstreamConfig            `yaml:"deepseek"`
+	Upstreams      map[string]UpstreamConfig `yaml:"upstreams"`
+	Routes         map[string]RouteConfig    `yaml:"routes"`
+	Vision         VisionConfig              `yaml:"vision"`
+	Admission      AdmissionConfig           `yaml:"admission"`
+	CircuitBreaker CircuitBreakerConfig      `yaml:"circuit_breaker"`
 }
 
 type ServerConfig struct {
@@ -34,6 +36,20 @@ type UpstreamConfig struct {
 	RenderTimeout         time.Duration `yaml:"render_timeout"`
 	ResponseHeaderTimeout time.Duration `yaml:"response_header_timeout"`
 }
+
+type RouteConfig struct {
+	Upstream        string          `yaml:"upstream"`
+	Model           string          `yaml:"model"`
+	ThinkingAdapter ThinkingAdapter `yaml:"thinking_adapter"`
+}
+
+type ThinkingAdapter string
+
+const (
+	ThinkingPassthrough ThinkingAdapter = "passthrough"
+	ThinkingDeepSeek    ThinkingAdapter = "deepseek"
+	ThinkingQwen        ThinkingAdapter = "qwen"
+)
 
 type VisionConfig struct {
 	Enabled                bool          `yaml:"enabled"`
@@ -93,6 +109,39 @@ func (c Config) Validate() error {
 	if c.DeepSeek.Model == "" {
 		errs = append(errs, errors.New("deepseek.model is required"))
 	}
+	upstreams := c.UpstreamConfigs()
+	for name, upstream := range c.Upstreams {
+		if name == "deepseek" {
+			errs = append(errs, errors.New("upstreams.deepseek is reserved; configure the default deepseek upstream at top level"))
+			continue
+		}
+		if err := validateURL("upstreams."+name+".base_url", upstream.BaseURL); err != nil {
+			errs = append(errs, err)
+		}
+		if upstream.Model == "" {
+			errs = append(errs, fmt.Errorf("upstreams.%s.model is required", name))
+		}
+	}
+	for alias, route := range c.Routes {
+		if alias == "" {
+			errs = append(errs, errors.New("routes cannot contain an empty alias"))
+		}
+		if route.Upstream == "" {
+			errs = append(errs, fmt.Errorf("routes.%s.upstream is required", alias))
+			continue
+		}
+		upstream, ok := upstreams[route.Upstream]
+		if !ok {
+			errs = append(errs, fmt.Errorf("routes.%s references unknown upstream %q", alias, route.Upstream))
+			continue
+		}
+		if route.Model == "" && upstream.Model == "" {
+			errs = append(errs, fmt.Errorf("routes.%s.model or upstream model is required", alias))
+		}
+		if route.ThinkingAdapter != "" && !route.ThinkingAdapter.IsValid() {
+			errs = append(errs, fmt.Errorf("routes.%s.thinking_adapter must be one of passthrough, deepseek, qwen", alias))
+		}
+	}
 	if c.Vision.Enabled {
 		if err := validateURL("vision.base_url", c.Vision.BaseURL); err != nil {
 			errs = append(errs, err)
@@ -120,6 +169,24 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("circuit breaker values must be positive"))
 	}
 	return errors.Join(errs...)
+}
+
+func (c Config) UpstreamConfigs() map[string]UpstreamConfig {
+	upstreams := make(map[string]UpstreamConfig, len(c.Upstreams)+1)
+	upstreams["deepseek"] = c.DeepSeek
+	for name, upstream := range c.Upstreams {
+		upstreams[name] = upstream
+	}
+	return upstreams
+}
+
+func (a ThinkingAdapter) IsValid() bool {
+	switch a {
+	case ThinkingPassthrough, ThinkingDeepSeek, ThinkingQwen:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateURL(name, value string) error {

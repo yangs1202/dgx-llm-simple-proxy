@@ -1,19 +1,42 @@
 # dgx-llm-simple-proxy
 
-An OpenAI-compatible Go proxy for a DeepSeek text model and a separate vision model. It converts image inputs into cached text descriptions, then sends the transformed request to DeepSeek. It also protects a DGX deployment with token-aware admission control and circuit breakers.
+An OpenAI-compatible Go proxy for configurable text-model upstreams and a separate vision model. It converts image inputs into cached text descriptions, then sends the transformed request to the selected upstream. It also protects a DGX deployment with token-aware admission control and circuit breakers.
 
-The public model name is `deepseek-v4-flash-0731`.
+The default public model name is `deepseek-v4-flash-0731`.
 
 ## Behavior
 
 - `POST /v1/chat/completions` supports streaming and non-streaming requests.
-- Request fields are passed through unchanged, including `stream`, `thinking`, `reasoning_effort`, tools, and `parallel_tool_calls`. Only `model` is mapped to the configured DeepSeek model, and image parts are replaced with text descriptions.
+- Request fields are passed through unchanged, including `stream`, `reasoning_effort`, tools, and `parallel_tool_calls`. `model` selects a configured route and is replaced with that route's upstream model; image parts are replaced with text descriptions.
 - Images supplied as data URLs or remote HTTP(S) URLs are described by the configured vision model.
 - Descriptions are cached by SHA-256 image content. Concurrent requests for the same image share one vision call. The cache is in memory and lasts for the process lifetime.
-- Prompt tokens are counted with the DeepSeek `/v1/chat/completions/render` endpoint before admission.
+- Prompt tokens are counted with the selected upstream's `/v1/tokenize` endpoint before admission.
 - Long requests can be limited independently while short requests continue to use the remaining capacity.
 - Three consecutive transport errors or HTTP 5xx responses open the affected upstream circuit for 20 seconds by default. The proxy returns HTTP 503 while open and permits one half-open probe afterward.
 - Client cancellation is propagated to both upstreams.
+
+Model aliases can route requests to another upstream. Add named upstreams and
+map the client-facing model name in `routes`:
+
+```yaml
+upstreams:
+  qwen:
+    base_url: "http://127.0.0.1:8892"
+    model: "qwen3.8-27b"
+    render_timeout: 180s
+    response_header_timeout: 300s
+routes:
+  deepseek:
+    upstream: qwen
+    thinking_adapter: qwen
+```
+
+With this configuration, `model: "deepseek"` is sent to Qwen. The `qwen`
+thinking adapter converts `thinking` booleans or DeepSeek-style
+`thinking.type` values to Qwen's `chat_template_kwargs.enable_thinking`. The
+`deepseek` adapter performs the reverse conversion. Other request fields and
+custom template options are preserved. If no route matches, requests retain
+the legacy behavior and use the default `deepseek` upstream.
 
 Other endpoints:
 

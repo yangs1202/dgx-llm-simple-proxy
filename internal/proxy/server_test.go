@@ -63,6 +63,127 @@ func TestPassthroughAndStreaming(t *testing.T) {
 	}
 }
 
+func TestAliasRouteToQwenAdaptsThinking(t *testing.T) {
+	var completionPayload map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/tokenize":
+			writeJSON(w, http.StatusOK, map[string]any{"token_ids": []int{1, 2}})
+		case "/v1/chat/completions":
+			if err := json.NewDecoder(r.Body).Decode(&completionPayload); err != nil {
+				t.Fatal(err)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"choices": []any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream.URL, "")
+	cfg.Upstreams = map[string]config.UpstreamConfig{
+		"qwen": {BaseURL: upstream.URL, Model: "qwen3.8-27b", RenderTimeout: time.Second, ResponseHeaderTimeout: time.Second},
+	}
+	cfg.Routes = map[string]config.RouteConfig{
+		"deepseek": {Upstream: "qwen", ThinkingAdapter: config.ThinkingQwen},
+	}
+	server := httptest.NewServer(New(cfg, discardLogger()).Handler())
+	defer server.Close()
+
+	body := `{"model":"deepseek","messages":[{"role":"user","content":"hello"}],"thinking":{"type":"disabled"},"reasoning_effort":"none","chat_template_kwargs":{"custom":"keep"}}`
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", response.StatusCode)
+	}
+	if completionPayload["model"] != "qwen3.8-27b" {
+		t.Fatalf("model was not routed to qwen: %#v", completionPayload["model"])
+	}
+	if _, exists := completionPayload["thinking"]; exists {
+		t.Fatalf("deepseek thinking field leaked to qwen: %#v", completionPayload)
+	}
+	kwargs, ok := completionPayload["chat_template_kwargs"].(map[string]any)
+	if !ok || kwargs["enable_thinking"] != false || kwargs["custom"] != "keep" {
+		t.Fatalf("qwen thinking compatibility mapping is invalid: %#v", completionPayload["chat_template_kwargs"])
+	}
+}
+
+func TestAliasRouteToDeepSeekAdaptsQwenThinking(t *testing.T) {
+	var completionPayload map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/tokenize":
+			writeJSON(w, http.StatusOK, map[string]any{"token_ids": []int{1}})
+		case "/v1/chat/completions":
+			if err := json.NewDecoder(r.Body).Decode(&completionPayload); err != nil {
+				t.Fatal(err)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"choices": []any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream.URL, "")
+	cfg.Routes = map[string]config.RouteConfig{
+		"qwen": {Upstream: "deepseek", ThinkingAdapter: config.ThinkingDeepSeek},
+	}
+	server := httptest.NewServer(New(cfg, discardLogger()).Handler())
+	defer server.Close()
+
+	body := `{"model":"qwen","messages":[{"role":"user","content":"hello"}],"chat_template_kwargs":{"enable_thinking":true,"custom":"keep"}}`
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", response.StatusCode)
+	}
+	thinking, ok := completionPayload["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" {
+		t.Fatalf("deepseek thinking compatibility mapping is invalid: %#v", completionPayload["thinking"])
+	}
+	kwargs, ok := completionPayload["chat_template_kwargs"].(map[string]any)
+	if !ok || kwargs["custom"] != "keep" {
+		t.Fatalf("custom template options were not preserved: %#v", completionPayload["chat_template_kwargs"])
+	}
+	if _, exists := kwargs["enable_thinking"]; exists {
+		t.Fatalf("qwen thinking field leaked to deepseek: %#v", kwargs)
+	}
+}
+
+func TestModelsListsConfiguredAliases(t *testing.T) {
+	cfg := testConfig("http://127.0.0.1:18888", "")
+	cfg.Routes = map[string]config.RouteConfig{
+		"qwen":     {Upstream: "deepseek", ThinkingAdapter: config.ThinkingDeepSeek},
+		"deepseek": {Upstream: "deepseek", ThinkingAdapter: config.ThinkingDeepSeek},
+	}
+	server := httptest.NewServer(New(cfg, discardLogger()).Handler())
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 2 || payload.Data[0].ID != "deepseek" || payload.Data[1].ID != "qwen" {
+		t.Fatalf("unexpected model aliases: %#v", payload.Data)
+	}
+}
+
 func TestImageIsDescribedOnceAndReplaced(t *testing.T) {
 	var visionCalls atomic.Int32
 	vision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
