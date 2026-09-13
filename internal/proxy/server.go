@@ -441,7 +441,11 @@ func textContent(content any) string {
 func (s *Server) renderTokenCount(ctx context.Context, target route, body []byte) (int, error) {
 	renderCtx, cancel := context.WithTimeout(ctx, target.upstream.config.RenderTimeout)
 	defer cancel()
-	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, joinURL(target.upstream.config.BaseURL, tokenCountPath(target.upstream.config)), target.upstream.config.APIKey, body)
+	tokenizeBody, err := tokenizationBody(body)
+	if err != nil {
+		return 0, err
+	}
+	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, joinURL(target.upstream.config.BaseURL, tokenCountPath(target.upstream.config)), target.upstream.config.APIKey, tokenizeBody)
 	if err != nil {
 		return 0, err
 	}
@@ -452,11 +456,37 @@ func (s *Server) renderTokenCount(ctx context.Context, target route, body []byte
 	}
 	var result struct {
 		TokenIDs []json.Number `json:"token_ids"`
+		Tokens   []json.Number `json:"tokens"`
+		Count    json.Number   `json:"count"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		return 0, fmt.Errorf("decode render response: %w", err)
 	}
+	if len(result.TokenIDs) > 0 {
+		return len(result.TokenIDs), nil
+	}
+	if len(result.Tokens) > 0 {
+		return len(result.Tokens), nil
+	}
+	if result.Count != "" {
+		count, err := strconv.Atoi(result.Count.String())
+		if err != nil {
+			return 0, fmt.Errorf("decode token count: %w", err)
+		}
+		return count, nil
+	}
 	return len(result.TokenIDs), nil
+}
+
+func tokenizationBody(body []byte) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("decode tokenization request: %w", err)
+	}
+	// SGLang's /v1/tokenize endpoint is not a streaming endpoint. The
+	// client's stream setting is kept for the actual completion request.
+	delete(payload, "stream")
+	return json.Marshal(payload)
 }
 
 func tokenCountPath(upstream config.UpstreamConfig) string {

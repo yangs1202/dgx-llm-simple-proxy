@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -16,9 +17,13 @@ import (
 
 func TestPassthroughAndStreaming(t *testing.T) {
 	var completionPayload map[string]any
+	var tokenizePayload map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/tokenize":
+			if err := json.NewDecoder(r.Body).Decode(&tokenizePayload); err != nil {
+				t.Fatal(err)
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"token_ids": []int{1, 2, 3}})
 		case "/v1/chat/completions":
 			if err := json.NewDecoder(r.Body).Decode(&completionPayload); err != nil {
@@ -52,6 +57,9 @@ func TestPassthroughAndStreaming(t *testing.T) {
 	if completionPayload["stream"] != true || completionPayload["parallel_tool_calls"] != true {
 		t.Fatalf("stream/tool settings were not passed through: %#v", completionPayload)
 	}
+	if _, exists := tokenizePayload["stream"]; exists {
+		t.Fatalf("stream must not be sent to tokenization endpoint: %#v", tokenizePayload)
+	}
 	if _, ok := completionPayload["thinking"]; !ok {
 		t.Fatal("thinking was dropped")
 	}
@@ -60,6 +68,34 @@ func TestPassthroughAndStreaming(t *testing.T) {
 	}
 	if _, ok := completionPayload["custom_parameter"]; !ok {
 		t.Fatal("unknown parameter was dropped")
+	}
+}
+
+func TestTokenCountAcceptsSGLangResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/tokenize" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"tokens": []int{1, 2, 3, 4},
+				"count":  4,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"choices": []any{}})
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream.URL, "")
+	server := New(cfg, discardLogger())
+	target, ok := server.resolveRoute(cfg.DeepSeek.Model)
+	if !ok {
+		t.Fatal("default route is unavailable")
+	}
+	got, err := server.renderTokenCount(context.Background(), target, []byte(`{"messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 4 {
+		t.Fatalf("token count = %d, want 4", got)
 	}
 }
 
