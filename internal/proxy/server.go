@@ -450,27 +450,29 @@ func (s *Server) replaceImages(ctx context.Context, payload map[string]any) erro
 			continue
 		}
 
-		plan := imagePlan{
-			message:     message,
-			converted:   make([]any, len(parts)),
-			taskIndices: make([]int, len(parts)),
-		}
+		var taskIndices []int
 		for index, rawPart := range parts {
-			plan.taskIndices[index] = -1
 			part, ok := rawPart.(map[string]any)
 			if !ok || !isImagePart(part) {
-				plan.converted[index] = rawPart
 				continue
 			}
 			source, err := imageSource(part)
 			if err != nil {
 				return err
 			}
-			plan.taskIndices[index] = len(tasks)
+			if taskIndices == nil {
+				taskIndices = make([]int, len(parts))
+				for index := range taskIndices {
+					taskIndices[index] = -1
+				}
+			}
+			taskIndices[index] = len(tasks)
 			tasks = append(tasks, imageTask{source: source})
 		}
-		if hasImageTask(plan.taskIndices) {
-			plans = append(plans, plan)
+		if taskIndices != nil {
+			converted := make([]any, len(parts))
+			copy(converted, parts)
+			plans = append(plans, imagePlan{message: message, converted: converted, taskIndices: taskIndices})
 		}
 	}
 	if err := s.describeImages(ctx, tasks); err != nil {
@@ -490,15 +492,6 @@ func (s *Server) replaceImages(ctx context.Context, payload map[string]any) erro
 		plan.message["content"] = plan.converted
 	}
 	return nil
-}
-
-func hasImageTask(indices []int) bool {
-	for _, index := range indices {
-		if index >= 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) describeImages(ctx context.Context, tasks []imageTask) error {
