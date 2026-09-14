@@ -111,7 +111,13 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	payload["model"] = route.model
 	adaptThinking(payload, route.adapter)
+	if r.Context().Err() != nil {
+		return
+	}
 	if err := s.replaceImages(r.Context(), payload); err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		if errors.Is(err, circuit.ErrOpen) {
 			s.writeCircuitError(w, s.visionBreaker, err)
 			return
@@ -125,8 +131,14 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if r.Context().Err() != nil {
+		return
+	}
 	tokens, err := s.renderTokenCount(r.Context(), route, body)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		if errors.Is(err, circuit.ErrOpen) {
 			s.writeCircuitError(w, route.upstream.breaker, err)
 			return
@@ -138,6 +150,9 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	release, err := s.admission.Acquire(queueCtx, tokens)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		s.rejected.Add(1)
 		if errors.Is(err, context.DeadlineExceeded) {
 			s.writeError(w, http.StatusServiceUnavailable, "overloaded", "admission queue timeout")
@@ -148,13 +163,19 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	if r.Context().Err() != nil {
+		return
+	}
 	response, err := s.doUpstream(r.Context(), route.upstream.client, route.upstream.breaker, joinURL(route.upstream.config.BaseURL, "/v1/chat/completions"), route.upstream.config.APIKey, body)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		s.writeCircuitError(w, route.upstream.breaker, err)
 		return
 	}
 	defer response.Body.Close()
-	s.copyResponse(w, response)
+	s.copyResponse(r.Context(), w, response)
 }
 
 func (s *Server) resolveRoute(requestedModel any) (route, bool) {
@@ -497,6 +518,9 @@ func tokenCountPath(upstream config.UpstreamConfig) string {
 }
 
 func (s *Server) doUpstream(ctx context.Context, client *http.Client, breaker *circuit.Breaker, endpoint, apiKey string, body []byte) (*http.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := breaker.Allow(); err != nil {
 		return nil, err
 	}
@@ -511,7 +535,13 @@ func (s *Server) doUpstream(ctx context.Context, client *http.Client, breaker *c
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		breaker.Failure()
+		if !errors.Is(err, context.Canceled) && !errors.Is(ctx.Err(), context.Canceled) {
+			breaker.Failure()
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		response.Body.Close()
 		return nil, err
 	}
 	if response.StatusCode >= 500 {
@@ -522,7 +552,7 @@ func (s *Server) doUpstream(ctx context.Context, client *http.Client, breaker *c
 	return response, nil
 }
 
-func (s *Server) copyResponse(w http.ResponseWriter, response *http.Response) {
+func (s *Server) copyResponse(ctx context.Context, w http.ResponseWriter, response *http.Response) {
 	for key, values := range response.Header {
 		if isHopByHop(key) {
 			continue
@@ -535,8 +565,14 @@ func (s *Server) copyResponse(w http.ResponseWriter, response *http.Response) {
 	buffer := make([]byte, 32*1024)
 	flusher, _ := w.(http.Flusher)
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		read, err := response.Body.Read(buffer)
 		if read > 0 {
+			if ctx.Err() != nil {
+				return
+			}
 			if _, writeErr := w.Write(buffer[:read]); writeErr != nil {
 				return
 			}

@@ -71,6 +71,45 @@ func TestPassthroughAndStreaming(t *testing.T) {
 	}
 }
 
+func TestClientCancellationPreventsLaterUpstreamRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var completionCalls atomic.Int32
+	server := New(testConfig("http://upstream.invalid", ""), discardLogger())
+	server.upstreams["deepseek"].client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/v1/tokenize" {
+			cancel()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"token_ids":[1]}`)),
+			}, nil
+		}
+		if request.URL.Path == "/v1/chat/completions" {
+			completionCalls.Add(1)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[]}`)),
+		}, nil
+	})}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4-flash-0731","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
+	server.chatCompletions(httptest.NewRecorder(), request)
+
+	if got := completionCalls.Load(); got != 0 {
+		t.Fatalf("completion requests after client cancellation = %d, want 0", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 func TestTokenCountAcceptsSGLangResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/tokenize" {
