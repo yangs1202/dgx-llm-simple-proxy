@@ -28,7 +28,11 @@ type Data struct {
 func NewReader(maxBytes int64, allowRemote, allowPrivate bool, timeoutClient *http.Client) *Reader {
 	client := timeoutClient
 	if allowRemote && !allowPrivate {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+		baseTransport, ok := timeoutClient.Transport.(*http.Transport)
+		if !ok {
+			baseTransport = http.DefaultTransport.(*http.Transport)
+		}
+		transport := baseTransport.Clone()
 		dialer := &net.Dialer{}
 		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(address)

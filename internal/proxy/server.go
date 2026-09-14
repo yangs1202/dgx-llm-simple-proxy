@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,31 +27,102 @@ import (
 )
 
 type Server struct {
-	cfg           config.Config
-	logger        *slog.Logger
-	upstreams     map[string]*upstream
-	visionClient  *http.Client
-	images        *imageutil.Reader
-	cache         *imageutil.DescriptionCache
-	admission     *admission.Controller
-	visionBreaker *circuit.Breaker
-	requests      atomic.Uint64
-	errors        atomic.Uint64
-	rejected      atomic.Uint64
-	cacheHits     atomic.Uint64
-	cacheMisses   atomic.Uint64
+	cfg            config.Config
+	logger         *slog.Logger
+	upstreams      map[string]*upstream
+	visionClient   *http.Client
+	visionEndpoint string
+	visionSlots    chan struct{}
+	images         *imageutil.Reader
+	cache          *imageutil.DescriptionCache
+	admission      *admission.Controller
+	visionBreaker  *circuit.Breaker
+	metricsCache   metricsCache
+	requests       atomic.Uint64
+	errors         atomic.Uint64
+	rejected       atomic.Uint64
+	cacheHits      atomic.Uint64
+	cacheMisses    atomic.Uint64
 }
 
 type upstream struct {
-	config  config.UpstreamConfig
-	client  *http.Client
-	breaker *circuit.Breaker
+	config             config.UpstreamConfig
+	client             *http.Client
+	breaker            *circuit.Breaker
+	completionEndpoint string
+	tokenCountEndpoint string
+	healthEndpoint     string
+	metricsEndpoint    string
 }
 
 type route struct {
 	upstream *upstream
 	model    string
 	adapter  config.ThinkingAdapter
+}
+
+const (
+	upstreamMaxIdleConns        = 32
+	upstreamMaxIdleConnsPerHost = 8
+	responseBufferSize          = 32 * 1024
+	vllmMetricsCacheTTL         = 5 * time.Second
+)
+
+var responseBufferPool = sync.Pool{
+	New: func() any { return make([]byte, responseBufferSize) },
+}
+
+type metricsFlight struct {
+	done  chan struct{}
+	value string
+	err   error
+}
+
+type metricsCache struct {
+	mu        sync.Mutex
+	value     string
+	fetchedAt time.Time
+	flight    *metricsFlight
+}
+
+func (c *metricsCache) get(ctx context.Context, fetch func(context.Context) (string, error)) (string, error) {
+	c.mu.Lock()
+	if !c.fetchedAt.IsZero() && time.Since(c.fetchedAt) < vllmMetricsCacheTTL {
+		value := c.value
+		c.mu.Unlock()
+		return value, nil
+	}
+	if c.flight != nil {
+		flight := c.flight
+		c.mu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.value, flight.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	flight := &metricsFlight{done: make(chan struct{})}
+	c.flight = flight
+	stale := c.value
+	c.mu.Unlock()
+
+	value, err := fetch(ctx)
+	if err != nil {
+		value = stale
+	}
+
+	c.mu.Lock()
+	flight.value = value
+	flight.err = err
+	if err == nil {
+		c.value = value
+		c.fetchedAt = time.Now()
+	}
+	c.flight = nil
+	close(flight.done)
+	c.mu.Unlock()
+	return value, err
 }
 
 func New(cfg config.Config, logger *slog.Logger) *Server {
@@ -60,19 +132,30 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 	upstreams := make(map[string]*upstream, len(cfg.UpstreamConfigs()))
 	for name, upstreamConfig := range cfg.UpstreamConfigs() {
 		upstreams[name] = &upstream{
-			config:  upstreamConfig,
-			client:  &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: upstreamConfig.ResponseHeaderTimeout}},
-			breaker: circuit.New(cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.OpenDuration),
+			config:             upstreamConfig,
+			client:             newModelClient(upstreamConfig.ResponseHeaderTimeout),
+			breaker:            circuit.New(cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.OpenDuration),
+			completionEndpoint: joinURL(upstreamConfig.BaseURL, "/v1/chat/completions"),
+			tokenCountEndpoint: joinURL(upstreamConfig.BaseURL, tokenCountPath(upstreamConfig)),
+			healthEndpoint:     joinURL(upstreamConfig.BaseURL, "/health"),
+			metricsEndpoint:    joinURL(upstreamConfig.BaseURL, "/metrics"),
 		}
 	}
-	visionClient := &http.Client{Timeout: cfg.Vision.Timeout}
+	visionClient := newUpstreamClient(0)
+	visionClient.Timeout = cfg.Vision.Timeout
+	visionConcurrency := cfg.Admission.MaxActiveRequests
+	if visionConcurrency <= 0 {
+		visionConcurrency = 1
+	}
 	return &Server{
-		cfg:          cfg,
-		logger:       logger,
-		upstreams:    upstreams,
-		visionClient: visionClient,
-		images:       imageutil.NewReader(cfg.Vision.MaxImageBytes, cfg.Vision.AllowRemoteImages, cfg.Vision.AllowPrivateImageHosts, visionClient),
-		cache:        imageutil.NewDescriptionCache(cfg.Vision.CacheEntries),
+		cfg:            cfg,
+		logger:         logger,
+		upstreams:      upstreams,
+		visionClient:   visionClient,
+		visionEndpoint: joinURL(cfg.Vision.BaseURL, "/v1/chat/completions"),
+		visionSlots:    make(chan struct{}, visionConcurrency),
+		images:         imageutil.NewReader(cfg.Vision.MaxImageBytes, cfg.Vision.AllowRemoteImages, cfg.Vision.AllowPrivateImageHosts, visionClient),
+		cache:          imageutil.NewDescriptionCache(cfg.Vision.CacheEntries),
 		admission: admission.New(admission.Config{
 			LongPromptTokens:       cfg.Admission.LongPromptTokens,
 			TotalPromptTokenBudget: cfg.Admission.TotalPromptTokenBudget,
@@ -82,6 +165,21 @@ func New(cfg config.Config, logger *slog.Logger) *Server {
 		}),
 		visionBreaker: circuit.New(cfg.CircuitBreaker.FailureThreshold, cfg.CircuitBreaker.OpenDuration),
 	}
+}
+
+func newUpstreamClient(responseHeaderTimeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = upstreamMaxIdleConns
+	transport.MaxIdleConnsPerHost = upstreamMaxIdleConnsPerHost
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: transport}
+}
+
+func newModelClient(responseHeaderTimeout time.Duration) *http.Client {
+	client := newUpstreamClient(responseHeaderTimeout)
+	client.Transport.(*http.Transport).Proxy = nil
+	return client
 }
 
 func (s *Server) Handler() http.Handler {
@@ -126,6 +224,11 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tokenizeBody, err := tokenizationBodyFromPayload(payload)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -134,7 +237,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Err() != nil {
 		return
 	}
-	tokens, err := s.renderTokenCount(r.Context(), route, body)
+	tokens, err := s.renderTokenCountBody(r.Context(), route, tokenizeBody)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
@@ -166,7 +269,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Err() != nil {
 		return
 	}
-	response, err := s.doUpstream(r.Context(), route.upstream.client, route.upstream.breaker, joinURL(route.upstream.config.BaseURL, "/v1/chat/completions"), route.upstream.config.APIKey, body)
+	response, err := s.doUpstream(r.Context(), route.upstream.client, route.upstream.breaker, route.upstream.completionEndpoint, route.upstream.config.APIKey, body)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
@@ -317,11 +420,26 @@ func removeQwenThinkingOption(payload map[string]any) {
 	}
 }
 
+type imageTask struct {
+	source      string
+	description string
+	err         error
+}
+
+type imagePlan struct {
+	message     map[string]any
+	converted   []any
+	taskIndices []int
+}
+
 func (s *Server) replaceImages(ctx context.Context, payload map[string]any) error {
 	messages, ok := payload["messages"].([]any)
 	if !ok {
 		return nil
 	}
+
+	plans := make([]imagePlan, 0, len(messages))
+	tasks := make([]imageTask, 0)
 	for _, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
 		if !ok {
@@ -331,27 +449,95 @@ func (s *Server) replaceImages(ctx context.Context, payload map[string]any) erro
 		if !ok {
 			continue
 		}
-		converted := make([]any, 0, len(parts))
-		for _, rawPart := range parts {
+
+		plan := imagePlan{
+			message:     message,
+			converted:   make([]any, len(parts)),
+			taskIndices: make([]int, len(parts)),
+		}
+		for index, rawPart := range parts {
+			plan.taskIndices[index] = -1
 			part, ok := rawPart.(map[string]any)
 			if !ok || !isImagePart(part) {
-				converted = append(converted, rawPart)
+				plan.converted[index] = rawPart
 				continue
 			}
 			source, err := imageSource(part)
 			if err != nil {
 				return err
 			}
-			description, err := s.describeImage(ctx, source)
-			if err != nil {
-				return err
-			}
-			converted = append(converted, map[string]any{
-				"type": "text",
-				"text": "[Image description]\n" + description,
-			})
+			plan.taskIndices[index] = len(tasks)
+			tasks = append(tasks, imageTask{source: source})
 		}
-		message["content"] = converted
+		if hasImageTask(plan.taskIndices) {
+			plans = append(plans, plan)
+		}
+	}
+	if err := s.describeImages(ctx, tasks); err != nil {
+		return err
+	}
+
+	for _, plan := range plans {
+		for index, taskIndex := range plan.taskIndices {
+			if taskIndex < 0 {
+				continue
+			}
+			plan.converted[index] = map[string]any{
+				"type": "text",
+				"text": "[Image description]\n" + tasks[taskIndex].description,
+			}
+		}
+		plan.message["content"] = plan.converted
+	}
+	return nil
+}
+
+func hasImageTask(indices []int) bool {
+	for _, index := range indices {
+		if index >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) describeImages(ctx context.Context, tasks []imageTask) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	workerCount := len(tasks)
+	if limit := cap(s.visionSlots); limit > 0 && workerCount > limit {
+		workerCount = limit
+	}
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				tasks[index].description, tasks[index].err = s.describeImage(ctx, tasks[index].source)
+			}
+		}()
+	}
+
+dispatch:
+	for index := range tasks {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		if task.err != nil {
+			return task.err
+		}
 	}
 	return nil
 }
@@ -391,6 +577,14 @@ func (s *Server) describeImage(ctx context.Context, source string) (string, erro
 	missesBefore := s.cacheMisses.Load()
 	description, err := s.cache.GetOrCompute(ctx, key, func(ctx context.Context) (string, error) {
 		s.cacheMisses.Add(1)
+		if s.visionSlots != nil {
+			select {
+			case s.visionSlots <- struct{}{}:
+				defer func() { <-s.visionSlots }()
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
 		return s.callVision(ctx, data)
 	})
 	if err == nil && s.cacheMisses.Load() == missesBefore {
@@ -418,7 +612,7 @@ func (s *Server) callVision(ctx context.Context, data imageutil.Data) (string, e
 	if err != nil {
 		return "", err
 	}
-	response, err := s.doUpstream(ctx, s.visionClient, s.visionBreaker, joinURL(s.cfg.Vision.BaseURL, "/v1/chat/completions"), s.cfg.Vision.APIKey, body)
+	response, err := s.doUpstream(ctx, s.visionClient, s.visionBreaker, s.visionEndpoint, s.cfg.Vision.APIKey, body)
 	if err != nil {
 		return "", err
 	}
@@ -460,13 +654,17 @@ func textContent(content any) string {
 }
 
 func (s *Server) renderTokenCount(ctx context.Context, target route, body []byte) (int, error) {
-	renderCtx, cancel := context.WithTimeout(ctx, target.upstream.config.RenderTimeout)
-	defer cancel()
 	tokenizeBody, err := tokenizationBody(body)
 	if err != nil {
 		return 0, err
 	}
-	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, joinURL(target.upstream.config.BaseURL, tokenCountPath(target.upstream.config)), target.upstream.config.APIKey, tokenizeBody)
+	return s.renderTokenCountBody(ctx, target, tokenizeBody)
+}
+
+func (s *Server) renderTokenCountBody(ctx context.Context, target route, tokenizeBody []byte) (int, error) {
+	renderCtx, cancel := context.WithTimeout(ctx, target.upstream.config.RenderTimeout)
+	defer cancel()
+	response, err := s.doUpstream(renderCtx, target.upstream.client, target.upstream.breaker, target.upstream.tokenCountEndpoint, target.upstream.config.APIKey, tokenizeBody)
 	if err != nil {
 		return 0, err
 	}
@@ -508,6 +706,19 @@ func tokenizationBody(body []byte) ([]byte, error) {
 	// client's stream setting is kept for the actual completion request.
 	delete(payload, "stream")
 	return json.Marshal(payload)
+}
+
+func tokenizationBodyFromPayload(payload map[string]any) ([]byte, error) {
+	stream, present := payload["stream"]
+	delete(payload, "stream")
+	tokenizeBody, err := json.Marshal(payload)
+	if present {
+		payload["stream"] = stream
+	}
+	if err != nil {
+		return nil, fmt.Errorf("encode tokenization request: %w", err)
+	}
+	return tokenizeBody, nil
 }
 
 func tokenCountPath(upstream config.UpstreamConfig) string {
@@ -562,8 +773,12 @@ func (s *Server) copyResponse(ctx context.Context, w http.ResponseWriter, respon
 		}
 	}
 	w.WriteHeader(response.StatusCode)
-	buffer := make([]byte, 32*1024)
-	flusher, _ := w.(http.Flusher)
+	buffer := responseBufferPool.Get().([]byte)
+	defer responseBufferPool.Put(buffer)
+	var flusher http.Flusher
+	if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		flusher, _ = w.(http.Flusher)
+	}
 	for {
 		if ctx.Err() != nil {
 			return
@@ -605,7 +820,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusServiceUnavailable, "not_ready", "default route upstream is not configured")
 		return
 	}
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, joinURL(defaultRoute.upstream.config.BaseURL, "/health"), nil)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, defaultRoute.upstream.healthEndpoint, nil)
 	if err != nil {
 		s.writeError(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 		return
@@ -644,7 +859,7 @@ func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	a := s.admission.Snapshot()
 	v := s.visionBreaker.Snapshot()
-	vllmMetrics, err := s.fetchVLLMMetrics(r.Context())
+	vllmMetrics, err := s.metricsCache.get(r.Context(), s.fetchVLLMMetrics)
 	if err != nil {
 		s.logger.Warn("fetch vLLM metrics", "error", err)
 	}
@@ -682,7 +897,7 @@ func (s *Server) fetchVLLMMetrics(ctx context.Context) (string, error) {
 	if !ok {
 		return "", errors.New("default route upstream is not configured")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(defaultRoute.upstream.config.BaseURL, "/metrics"), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, defaultRoute.upstream.metricsEndpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}

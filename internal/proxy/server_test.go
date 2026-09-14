@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -352,12 +353,68 @@ func TestImageIsDescribedOnceAndReplaced(t *testing.T) {
 	}
 }
 
+func TestImagesAreDescribedConcurrently(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+	vision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		current := active.Add(1)
+		for {
+			maximum := maxActive.Load()
+			if current <= maximum || maxActive.CompareAndSwap(maximum, current) {
+				break
+			}
+		}
+		if current == 2 {
+			startedOnce.Do(func() { close(started) })
+		}
+		<-release
+		active.Add(-1)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": "description"}}},
+		})
+	}))
+	defer vision.Close()
+
+	cfg := testConfig("http://upstream.invalid", vision.URL)
+	server := New(cfg, discardLogger())
+	payload := map[string]any{
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,YQ=="}},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,Yg=="}},
+			},
+		}},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- server.replaceImages(context.Background(), payload) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("image descriptions did not run concurrently")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if maxActive.Load() != 2 {
+		t.Fatalf("maximum concurrent vision calls = %d, want 2", maxActive.Load())
+	}
+}
+
 func TestMetricsIncludesSelectedVLLMMetrics(t *testing.T) {
+	var metricsCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/metrics" {
 			http.NotFound(w, r)
 			return
 		}
+		metricsCalls.Add(1)
 		_, _ = io.WriteString(w, `# HELP vllm:kv_cache_usage_perc KV-cache usage.
 # TYPE vllm:kv_cache_usage_perc gauge
 vllm:kv_cache_usage_perc{model_name="deepseek"} 0.42
@@ -370,20 +427,65 @@ vllm:prompt_tokens_total{model_name="deepseek"} 999
 
 	server := httptest.NewServer(New(testConfig(upstream.URL, ""), discardLogger()).Handler())
 	defer server.Close()
-	response, err := http.Get(server.URL + "/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	body, _ := io.ReadAll(response.Body)
+	for range 2 {
+		response, err := http.Get(server.URL + "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
 
-	for _, metric := range []string{"vllm:kv_cache_usage_perc", "vllm:num_requests_running", "vllm:num_requests_waiting"} {
-		if !strings.Contains(string(body), metric) {
-			t.Fatalf("metric %s is missing from response:\n%s", metric, body)
+		for _, metric := range []string{"vllm:kv_cache_usage_perc", "vllm:num_requests_running", "vllm:num_requests_waiting"} {
+			if !strings.Contains(string(body), metric) {
+				t.Fatalf("metric %s is missing from response:\n%s", metric, body)
+			}
+		}
+		if strings.Contains(string(body), "vllm:prompt_tokens_total") {
+			t.Fatalf("unexpected vLLM metric was exposed:\n%s", body)
 		}
 	}
-	if strings.Contains(string(body), "vllm:prompt_tokens_total") {
-		t.Fatalf("unexpected vLLM metric was exposed:\n%s", body)
+	if metricsCalls.Load() != 1 {
+		t.Fatalf("vLLM metrics fetches = %d, want 1", metricsCalls.Load())
+	}
+}
+
+func TestMetricsCacheDeduplicatesConcurrentFetch(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+	cache := &metricsCache{}
+	fetch := func(context.Context) (string, error) {
+		calls.Add(1)
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return "cached metrics", nil
+	}
+
+	values := make([]string, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	for index := range values {
+		go func() {
+			defer workers.Done()
+			values[index], _ = cache.get(context.Background(), fetch)
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("metrics fetch did not start")
+	}
+	close(release)
+	workers.Wait()
+
+	if calls.Load() != 1 {
+		t.Fatalf("metrics fetches = %d, want 1", calls.Load())
+	}
+	for _, value := range values {
+		if value != "cached metrics" {
+			t.Fatalf("cached value = %q, want cached metrics", value)
+		}
 	}
 }
 
@@ -428,4 +530,28 @@ func testConfig(deepURL, visionURL string) config.Config {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func BenchmarkTokenizationBody(b *testing.B) {
+	body := []byte(`{"model":"deepseek-v4-flash-0731","messages":[{"role":"user","content":"hello"}],"stream":true,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]}`)
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := tokenizationBody(body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTokenizationBodyFromPayload(b *testing.B) {
+	body := []byte(`{"model":"deepseek-v4-flash-0731","messages":[{"role":"user","content":"hello"}],"stream":true,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]}`)
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := tokenizationBodyFromPayload(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
